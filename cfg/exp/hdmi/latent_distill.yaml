@@ -1,0 +1,14 @@
+# @package _global_
+
+# AnyBody Stage 1: distill the suitcase object-pose teacher into a latent-bottleneck student.
+defaults:
+  - override /algo: hdmi_latent_distill
+
+exp_name: hdmi-latent-distill
+seed: 0
+total_iters: 10000
+checkpoint_interval: 1000
+upload_interval: 1000
+
+algo:
+  teacher_checkpoint: run:elijahgalahad/mimic_lite/nnds9gg2:4000
