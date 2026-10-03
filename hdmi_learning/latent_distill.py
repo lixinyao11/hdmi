@@ -280,7 +280,7 @@ class _StudentRollout(nn.Module):
             tensordict.set(ACTION_KEY, action)
             return tensordict
         teacher_action = p.teacher(normalized)
-        use_teacher = self.mode == "train" and p.cfg.rollout_actor == "teacher"
+        use_teacher = p.cfg.rollout_actor == "teacher"
         tensordict.set(ACTION_KEY, teacher_action if use_teacher else action)
         tensordict.set(TEACHER_ACTION_KEY, teacher_action)
         tensordict.set(GOAL_MASK_KEY, goal_mask)
