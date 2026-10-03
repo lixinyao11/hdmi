@@ -259,7 +259,8 @@ class LatentKpDistillPolicy(PPOBase):
         if len(kp_group.split) != 1:
             raise ValueError(f"{KP_KEY} must hold exactly one term, got {list(kp_group.keys())}")
         kp_term = kp_group[list(kp_group.keys())[0]]
-        all_names = list(kp_term.command_manager.obs_body_names)
+        # Index space depends on the term class (obs_body_names vs tracking_body_names).
+        all_names = list(getattr(kp_term.command_manager, kp_term.available_body_names_attr))
         self.body_names = [all_names[i] for i in kp_term.body_indices_tracking.tolist()]
         self.num_steps = len(kp_term.future_step_indices)
         if kp_group.split[0] != self.num_steps * len(self.body_names) * 3:
