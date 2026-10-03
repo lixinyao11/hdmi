@@ -1,0 +1,33 @@
+# @package _global_
+
+# AnyBody Stage 2: sparse-keypoint encoder distilled against the frozen Stage 1 latent.
+defaults:
+  - override /algo: hdmi_latent_kp_distill
+
+exp_name: hdmi-latent-kp-distill
+seed: 0
+total_iters: 9000
+checkpoint_interval: 1000
+upload_interval: 1000
+
+algo:
+  # Stage 1 run g907tzp5 (AnyBody defaults), best eval at iter 2000.
+  stage1_checkpoint: run:xinyaoli511-sjtu-hpc-center/hdmi_anybody/g907tzp5:2000
+
+task:
+  shared:
+    # Adds torso_link so it can be a keypoint. Teacher terms select bodies by name, so their
+    # dims are unchanged.
+    obs_body_names:
+      - "pelvis"
+      - "torso_link"
+      - ".*_knee_link"
+      - ".*_toe_link"
+      - ".*_shoulder_yaw_link"
+      - ".*_elbow_link"
+      - ".*_wrist_yaw_link"
+  observation:
+    command_kp:
+      kp_pos:
+        _target_: mimic_lite.ref_body_pos_future_local
+        body_names: [torso_link, left_wrist_yaw_link, right_wrist_yaw_link, left_toe_link, right_toe_link]

@@ -17,6 +17,6 @@ if not hasattr(PPOBase, "from_env"):
     PPOBase.from_env = classmethod(_ppo_from_env)
 
 
-from . import latent_distill, ppo, ppo_roa
+from . import latent_distill, latent_kp_distill, ppo, ppo_roa
 
-__all__ = ["latent_distill", "ppo", "ppo_roa"]
+__all__ = ["latent_distill", "latent_kp_distill", "ppo", "ppo_roa"]
