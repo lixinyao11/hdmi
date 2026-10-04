@@ -112,6 +112,12 @@ class LatentKpDistillConfig:
     # Eval/deploy: one fixed mode for every env ("bernoulli" uses eval_p_see).
     eval_mode: str = "full"
     eval_p_see: float = 0.4
+    # Eval/deploy only probes of the object goal (always visible in training):
+    #   "visible"   normal
+    #   "masked"    object token removed from attention (out of distribution for the encoder)
+    #   "on_target" object token fed "object exactly on its reference" (zero spatial error):
+    #               in-distribution input that carries no information about where to move it
+    eval_object: str = "visible"
 
     # "student" = DAgger (AnyBody). "stage1" drives with D(z_full): a diagnostic that should
     # reproduce the Stage 1 student's tracking.
@@ -129,6 +135,8 @@ class LatentKpDistillConfig:
             raise ValueError(f"eval_mode {self.eval_mode!r} not in modes {list(self.modes)}")
         if not 0 <= self.phase1_end_iter <= self.phase2_end_iter:
             raise ValueError("need 0 <= phase1_end_iter <= phase2_end_iter")
+        if self.eval_object not in ("visible", "masked", "on_target"):
+            raise ValueError(f"eval_object must be visible/masked/on_target, got {self.eval_object!r}")
         if self.rollout_actor not in ("student", "stage1"):
             raise ValueError(f"rollout_actor must be 'student' or 'stage1', got {self.rollout_actor!r}")
 
@@ -182,18 +190,25 @@ class KeypointEncoder(nn.Module):
         self.transformer.load_state_dict(stage1.transformer.state_dict())
         self.mu_head.load_state_dict(stage1.mu_head.state_dict())
 
-    def forward(self, kp: torch.Tensor, obj: torch.Tensor, proprio: torch.Tensor, kp_mask: torch.Tensor) -> torch.Tensor:
-        """kp [N, B, S*3], obj [N, G_obj], proprio [N, P], kp_mask [N, B] (True = hidden) -> z."""
+    def forward(
+        self, kp: torch.Tensor, obj: torch.Tensor, proprio: torch.Tensor, kp_mask: torch.Tensor,
+        obj_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """kp [N, B, S*3], obj [N, G_obj], proprio [N, P], kp_mask [N, B] / obj_mask [N] (True = hidden) -> z."""
         n = kp.shape[0]
+        if obj_mask is None:
+            obj_mask = torch.zeros(n, dtype=torch.bool, device=kp.device)
         kp_tokens = (self.kp_proj(kp) + self.body_emb).masked_fill(kp_mask.unsqueeze(-1), 0.0)
-        obj_token = (self.object_proj(obj) + self.object_emb).unsqueeze(1)
+        obj_token = (self.object_proj(obj) + self.object_emb).masked_fill(obj_mask[:, None], 0.0).unsqueeze(1)
         proprio_tokens = torch.stack(
             [proj(x) for proj, x in zip(self.proprio_proj, proprio.split(self.proprio_split, dim=-1))], dim=1
         ) + self.proprio_emb
         tokens = torch.cat([self.cls_token.expand(n, -1, -1), kp_tokens, obj_token, proprio_tokens], dim=1)
         visible = torch.zeros(n, 1, dtype=torch.bool, device=kp.device)
-        rest = torch.zeros(n, 1 + len(self.proprio_split), dtype=torch.bool, device=kp.device)
-        out = self.transformer(tokens, src_key_padding_mask=torch.cat([visible, kp_mask, rest], dim=1))
+        proprio_pad = torch.zeros(n, len(self.proprio_split), dtype=torch.bool, device=kp.device)
+        out = self.transformer(
+            tokens, src_key_padding_mask=torch.cat([visible, kp_mask, obj_mask[:, None], proprio_pad], dim=1)
+        )
         z = self.mu_head(out[:, 0])
         return F.normalize(z, dim=-1, eps=1e-8) if self.latent_normalize else z
 
@@ -214,12 +229,21 @@ class _KpRollout(nn.Module):
         kp_mask, kp_mode = p.update_masks(tensordict, self.mode)
         x = p.prepare_inputs(tensordict)
         student = p.unwrapped_encoder()
-        z_kp = student(x["kp"], x["obj"], x["proprio"], kp_mask)
+        obj_mask, obj = None, x["obj"]
+        if self.mode != "train" and p.cfg.eval_object == "masked":
+            obj_mask = torch.ones(kp_mask.shape[0], dtype=torch.bool, device=p.device)
+        elif self.mode != "train" and p.cfg.eval_object == "on_target":
+            obj = p.object_on_target_input(obj.shape[0])
+        z_kp = student(x["kp"], obj, x["proprio"], kp_mask, obj_mask)
         action = p.stage1.decode(z_kp, x["proprio"])
         if self.mode == "deploy":
             tensordict.set(ACTION_KEY, action)
             return tensordict
-        z_full = p.stage1.encoder(x["goal"], x["proprio"], torch.zeros(x["goal"].shape[0], p.num_goal_tokens, dtype=torch.bool, device=p.device))
+        goal = x["goal"]
+        if self.mode != "train" and p.cfg.eval_object == "on_target":
+            goal = goal.clone()
+            goal[:, p.obj_slice] = p.object_on_target_input(goal.shape[0])
+        z_full = p.stage1.encoder(goal, x["proprio"], torch.zeros(goal.shape[0], p.num_goal_tokens, dtype=torch.bool, device=p.device))
         teacher_action = p.stage1.decode(z_full, x["proprio"])
         tensordict.set(ACTION_KEY, teacher_action if p.cfg.rollout_actor == "stage1" else action)
         tensordict.set(KP_MASK_KEY, kp_mask.clone())
@@ -367,6 +391,15 @@ class LatentKpDistillPolicy(PPOBase):
         lead = kp.shape[:-1]
         kp = kp.reshape(*lead, self.num_steps, len(self.body_names), 3).transpose(-3, -2).reshape(*lead, len(self.body_names), self.num_steps * 3)
         return {"goal": goal, "proprio": proprio, "kp": kp, "obj": goal[..., self.obj_slice]}
+
+    def object_on_target_input(self, n: int) -> torch.Tensor:
+        """Normalized object token for zero spatial error at every future step: position 0 and
+        rotation = identity (6D: first two rows of I)."""
+        steps = (self.obj_slice.stop - self.obj_slice.start) // 9
+        raw = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=self.device).repeat(steps)
+        full = torch.zeros(self.teacher.vecnorms[CMD_KEY].input_shape[0], device=self.device)
+        full[self.obj_slice] = raw
+        return self.teacher.normalize(CMD_KEY, full)[self.obj_slice].expand(n, -1)
 
     # ------------------------------------------------------------- interface
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
