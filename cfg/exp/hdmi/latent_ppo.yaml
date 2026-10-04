@@ -1,0 +1,33 @@
+# @package _global_
+
+# AnyBody Stage 3: PPO in the latent space of the frozen Stage 1 decoder, starting from Stage 2.
+defaults:
+  - override /algo: hdmi_latent_ppo
+
+exp_name: hdmi-latent-ppo
+seed: 0
+total_iters: 6000
+checkpoint_interval: 1000
+upload_interval: 1000
+
+algo:
+  # Stage 2 with box-goal masking (run 5ij3go9j, AnyBody plan-B schedule, obj_hidden_p_final=0.2).
+  stage2_checkpoint: run:xinyaoli511-sjtu-hpc-center/hdmi_anybody/5ij3go9j:5000
+
+task:
+  observation:
+    command_kp:
+      kp_pos:
+        _target_: hdmi.ref_body_pos_future_robot_anchor
+        body_names: [torso_link, left_wrist_yaw_link, right_wrist_yaw_link, left_toe_link, right_toe_link]
+    # Reward-only, noise-free (trailing underscore: kept, never fed to the policy).
+    rl_reward_:
+      kp_pos_err:
+        _target_: hdmi.kp_pos_error_w
+        body_names: [torso_link, left_wrist_yaw_link, right_wrist_yaw_link, left_toe_link, right_toe_link]
+      kp_vel_err:
+        _target_: mimic_lite.diff_body_lin_vel_future
+        body_names: [torso_link, left_wrist_yaw_link, right_wrist_yaw_link, left_toe_link, right_toe_link]
+        future_steps: [0]
+      anchor_err:
+        _target_: hdmi.anchor_error_w

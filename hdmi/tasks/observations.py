@@ -5,7 +5,7 @@ from mimic_lite.tasks.deferred import DeferredObservation as BaseObservation
 from mimic_lite.tasks.observations.track import _tracking_body_future_observation
 from mimic_lite.tasks.transforms import _body_pose_in_anchor_frame
 
-from active_adaptation.utils.math import matrix_from_quat, quat_rotate
+from active_adaptation.utils.math import matrix_from_quat, quat_conjugate, quat_mul, quat_rotate
 
 from .command import RobotObjectTracking
 
@@ -99,3 +99,29 @@ class ref_body_pos_future_robot_anchor(_tracking_body_future_observation, namesp
             quaternion_w,
         )
         return position.reshape(self.num_envs, -1)
+
+
+# --- Reward-only observations for latent RL (noise-free; kept in a trailing-underscore group) ---
+
+
+class kp_pos_error_w(_tracking_body_future_observation, namespace="hdmi"):
+    """Reference minus robot body position at the current step, world frame. [N, B*3]."""
+
+    def compute(self) -> torch.Tensor:
+        command = self.command_manager
+        current = command.obs_current_step_index
+        ref = command.ref_body_pos_future_w[:, current].index_select(1, self.body_indices_tracking)
+        robot = command.robot_body_link_pos_w.index_select(1, self.body_indices_tracking)
+        return (ref - robot).reshape(self.num_envs, -1)
+
+
+class anchor_error_w(_tracking_body_future_observation, namespace="hdmi"):
+    """Anchor (pelvis) world position error (3) and orientation error angle in rad (1). [N, 4]."""
+
+    def compute(self) -> torch.Tensor:
+        command = self.command_manager
+        current = command.obs_current_step_index
+        position = command.ref_anchor_pos_future_w[:, current] - command.robot_anchor_pos_w
+        relative = quat_mul(quat_conjugate(command.robot_anchor_quat_w), command.ref_anchor_quat_future_w[:, current])
+        angle = 2.0 * torch.acos(relative[:, 0].abs().clamp(max=1.0))
+        return torch.cat([position, angle[:, None]], dim=-1)
