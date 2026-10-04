@@ -59,6 +59,7 @@ from .latent_distill import FrozenTeacher, LatentStudent, TermTokenEncoder
 KP_KEY = "command_kp"
 KP_MASK_KEY = "kp_mask"  # [N, B] bool, True = hidden
 KP_MODE_KEY = "kp_mode"  # [N] long, index into mode_names
+OBJ_MASK_KEY = "obj_mask"  # [N] bool, True = object token hidden
 Z_FULL_KEY = "z_full"
 TEACHER_ACTION_KEY = "teacher_action"
 
@@ -108,6 +109,9 @@ class LatentKpDistillConfig:
     phase1_end_iter: int = 1500
     phase2_end_iter: int = 6500
     p_see_final: float = 0.4
+    # Object-goal masking in training, per episode: 0 in phase 1, ramps to obj_hidden_p_final over
+    # phase 2, held in phase 3. Never hidden when every keypoint of that episode is hidden.
+    obj_hidden_p_final: float = 0.0
 
     # Eval/deploy: one fixed mode for every env ("bernoulli" uses eval_p_see).
     eval_mode: str = "full"
@@ -219,20 +223,18 @@ class _KpRollout(nn.Module):
         object.__setattr__(self, "policy", policy)
         self.mode = mode
         self.in_keys = [CMD_KEY, OBS_KEY, KP_KEY, "is_init"]
-        self.out_keys = [ACTION_KEY] if mode == "deploy" else [ACTION_KEY, KP_MASK_KEY, KP_MODE_KEY, Z_FULL_KEY, TEACHER_ACTION_KEY]
+        self.out_keys = [ACTION_KEY] if mode == "deploy" else [ACTION_KEY, KP_MASK_KEY, KP_MODE_KEY, OBJ_MASK_KEY, Z_FULL_KEY, TEACHER_ACTION_KEY]
 
     @torch.no_grad()
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         p = self.policy
         if self.mode == "train":
             p.kp_vecnorm(tensordict[KP_KEY])  # running stats: rollout only, never in train_op
-        kp_mask, kp_mode = p.update_masks(tensordict, self.mode)
+        kp_mask, kp_mode, obj_mask = p.update_masks(tensordict, self.mode)
         x = p.prepare_inputs(tensordict)
         student = p.unwrapped_encoder()
-        obj_mask, obj = None, x["obj"]
-        if self.mode != "train" and p.cfg.eval_object == "masked":
-            obj_mask = torch.ones(kp_mask.shape[0], dtype=torch.bool, device=p.device)
-        elif self.mode != "train" and p.cfg.eval_object == "on_target":
+        obj = x["obj"]
+        if self.mode != "train" and p.cfg.eval_object == "on_target":
             obj = p.object_on_target_input(obj.shape[0])
         z_kp = student(x["kp"], obj, x["proprio"], kp_mask, obj_mask)
         action = p.stage1.decode(z_kp, x["proprio"])
@@ -248,6 +250,7 @@ class _KpRollout(nn.Module):
         tensordict.set(ACTION_KEY, teacher_action if p.cfg.rollout_actor == "stage1" else action)
         tensordict.set(KP_MASK_KEY, kp_mask.clone())
         tensordict.set(KP_MODE_KEY, kp_mode.clone())
+        tensordict.set(OBJ_MASK_KEY, obj_mask.clone())
         tensordict.set(Z_FULL_KEY, z_full)
         tensordict.set(TEACHER_ACTION_KEY, teacher_action)
         return tensordict
@@ -334,6 +337,7 @@ class LatentKpDistillPolicy(PPOBase):
         n = env.num_envs
         self._mask = torch.zeros(n, len(self.body_names), dtype=torch.bool, device=device)
         self._mode = torch.zeros(n, dtype=torch.long, device=device)
+        self._obj_mask = torch.zeros(n, dtype=torch.bool, device=device)
         self._phase_seen = -1
 
     # ---------------------------------------------------------------- helpers
@@ -343,20 +347,20 @@ class LatentKpDistillPolicy(PPOBase):
     def _iter(self) -> int:
         return int(getattr(self.env, "current_iter", 0))
 
-    def curriculum(self) -> tuple[int, torch.Tensor, float]:
-        """(phase, mode probabilities, bernoulli p_see) at the current iteration."""
+    def curriculum(self) -> tuple[int, torch.Tensor, float, float]:
+        """(phase, mode probabilities, bernoulli p_see, object hidden prob) at the current iteration."""
         c, it = self.cfg, self._iter()
         n_modes = len(self.mode_names)
         bern_only = torch.zeros(n_modes, device=self.device)
         bern_only[self.bernoulli_idx] = 1.0
         if it < c.phase1_end_iter:
-            return 0, bern_only, 1.0
+            return 0, bern_only, 1.0, 0.0
         if it < c.phase2_end_iter:
             frac = (it - c.phase1_end_iter) / max(c.phase2_end_iter - c.phase1_end_iter, 1)
-            return 1, bern_only, 1.0 + frac * (c.p_see_final - 1.0)
-        return 2, torch.full((n_modes,), 1.0 / n_modes, device=self.device), c.p_see_final
+            return 1, bern_only, 1.0 + frac * (c.p_see_final - 1.0), frac * c.obj_hidden_p_final
+        return 2, torch.full((n_modes,), 1.0 / n_modes, device=self.device), c.p_see_final, c.obj_hidden_p_final
 
-    def _sample(self, env_ids: torch.Tensor, probs: torch.Tensor, p_see: float) -> None:
+    def _sample(self, env_ids: torch.Tensor, probs: torch.Tensor, p_see: float, p_obj: float) -> None:
         modes = torch.multinomial(probs, env_ids.numel(), replacement=True)
         visible = self.mode_visible[modes].clone()
         bern = modes == self.bernoulli_idx
@@ -365,23 +369,30 @@ class LatentKpDistillPolicy(PPOBase):
             visible[bern] = visible[bern] & draw
         self._mode[env_ids] = modes
         self._mask[env_ids] = ~visible
+        # Hide the object goal only if at least one keypoint stays visible.
+        obj_hidden = (torch.rand(env_ids.numel(), device=self.device) < p_obj) & visible.any(dim=1)
+        self._obj_mask[env_ids] = obj_hidden
 
-    def update_masks(self, tensordict: TensorDictBase, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resample masks for envs that just reset; resample all when the curriculum phase changes."""
+    def update_masks(self, tensordict: TensorDictBase, mode: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Resample masks for envs that just reset; resample all when the curriculum phase changes.
+        Returns (kp_mask [N, B], kp_mode [N], obj_mask [N])."""
         if mode == "train":
-            phase, probs, p_see = self.curriculum()
+            phase, probs, p_see, p_obj = self.curriculum()
         else:
             probs = torch.zeros(len(self.mode_names), device=self.device)
             probs[self.mode_names.index(self.cfg.eval_mode)] = 1.0
-            phase, p_see = -2, self.cfg.eval_p_see
+            phase, p_see, p_obj = -2, self.cfg.eval_p_see, 0.0
         if phase != self._phase_seen:
             reset = torch.ones(self._mask.shape[0], dtype=torch.bool, device=self.device)
             self._phase_seen = phase
         else:
             reset = tensordict["is_init"].reshape(-1).bool()
         if reset.any():
-            self._sample(reset.nonzero().squeeze(-1), probs, p_see)
-        return self._mask, self._mode
+            self._sample(reset.nonzero().squeeze(-1), probs, p_see, p_obj)
+        obj_mask = self._obj_mask
+        if mode != "train" and self.cfg.eval_object == "masked":
+            obj_mask = torch.ones_like(obj_mask)  # eval probe: may hide everything
+        return self._mask, self._mode, obj_mask
 
     def prepare_inputs(self, tensordict: TensorDictBase) -> dict[str, torch.Tensor]:
         goal = self.teacher.normalize(CMD_KEY, tensordict[CMD_KEY])
@@ -415,7 +426,10 @@ class LatentKpDistillPolicy(PPOBase):
         teacher_action = tensordict[TEACHER_ACTION_KEY]
         kp_mask = tensordict[KP_MASK_KEY].bool()
         kp_mode = tensordict[KP_MODE_KEY].long()
+        obj_mask = tensordict[OBJ_MASK_KEY].bool()
         T = tensordict.shape[1]
+        obj_lat = torch.zeros(2, device=self.device)  # [object visible, object hidden]
+        obj_cnt = torch.zeros(2, device=self.device)
 
         n_modes = len(self.mode_names)
         lat_sum = torch.zeros(n_modes, device=self.device)
@@ -425,7 +439,7 @@ class LatentKpDistillPolicy(PPOBase):
         for epoch in range(cfg.num_epochs):
             acc = None
             for t in range(T):
-                z_kp = self.kp_encoder(x["kp"][:, t], x["obj"][:, t], x["proprio"][:, t], kp_mask[:, t])
+                z_kp = self.kp_encoder(x["kp"][:, t], x["obj"][:, t], x["proprio"][:, t], kp_mask[:, t], obj_mask[:, t])
                 lat = 1.0 - F.cosine_similarity(z_kp, z_full[:, t], dim=-1)
                 action = self.stage1.decode(z_kp, x["proprio"][:, t])
                 beh = (action - teacher_action[:, t]).square().mean()
@@ -435,6 +449,8 @@ class LatentKpDistillPolicy(PPOBase):
                     with torch.no_grad():
                         lat_sum.index_add_(0, kp_mode[:, t], lat.detach())
                         cnt.index_add_(0, kp_mode[:, t], torch.ones_like(lat))
+                        obj_lat.index_add_(0, obj_mask[:, t].long(), lat.detach())
+                        obj_cnt.index_add_(0, obj_mask[:, t].long(), torch.ones_like(lat))
                         sums["latent"] += lat.mean().item()
                         sums["behavior"] += beh.item()
                         n_steps += 1
@@ -447,8 +463,12 @@ class LatentKpDistillPolicy(PPOBase):
                     acc = None
 
         self.num_updates += 1
-        phase, _, p_see = self.curriculum()
+        phase, _, p_see, p_obj = self.curriculum()
         info = {
+            "kp/obj_hidden_p": p_obj,
+            "kp/obj_hidden_frac": obj_mask.float().mean().item(),
+            # Must stay 0: the sampler never hides the object when every keypoint is hidden.
+            "kp/nothing_visible_frac": (kp_mask.all(-1) & obj_mask).float().mean().item(),
             "kp/latent_loss": sums["latent"] / max(n_steps, 1),
             "kp/behavior_loss": sums["behavior"] / max(n_steps, 1),
             "kp/grad_norm": sums["grad_norm"] / max(n_opt, 1),
@@ -459,10 +479,15 @@ class LatentKpDistillPolicy(PPOBase):
         if aa.is_distributed():
             dist.all_reduce(lat_sum)
             dist.all_reduce(cnt)
+            dist.all_reduce(obj_lat)
+            dist.all_reduce(obj_cnt)
             keys = sorted(info)
             vals = torch.tensor([info[k] for k in keys], device=self.device)
             dist.all_reduce(vals, op=dist.ReduceOp.AVG)
             info = dict(zip(keys, vals.tolist()))
+        for i, tag in enumerate(("obj_visible", "obj_hidden")):
+            if obj_cnt[i] > 0:
+                info[f"kp/latent_loss_{tag}"] = (obj_lat[i] / obj_cnt[i]).item()
         for i, m in enumerate(self.mode_names):
             if cnt[i] > 0:
                 info[f"kp/latent_loss_{m}"] = (lat_sum[i] / cnt[i]).item()
