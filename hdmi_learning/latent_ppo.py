@@ -30,8 +30,8 @@ Differences from AnyBody, deliberate:
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
 import math
 
 import torch
@@ -101,6 +101,9 @@ class LatentPPOConfig:
     obj_hidden_p: float = 0.2
     eval_mode: str = "full"
     eval_object: str = "visible"
+    # Eval-only extra keypoint modes (e.g. {"none": []}). Never set for training: Stage 2's final
+    # phase samples uniformly over all modes, so this would change the training distribution.
+    extra_modes: Dict[str, List[str]] = field(default_factory=dict)
 
     def __post_init__(self):
         self.in_keys = tuple(self.in_keys)
@@ -185,6 +188,8 @@ class LatentPPOPolicy(PPOBase):
             eval_object=self.cfg.eval_object, rollout_actor="student",
             in_keys=[CMD_KEY, OBS_KEY, KP_KEY],
         )
+        if self.cfg.extra_modes:
+            s2_algo["modes"] = {**s2_algo["modes"], **{k: list(v) for k, v in dict(self.cfg.extra_modes).items()}}
         s2_algo = {k: v for k, v in s2_algo.items() if k in LatentKpDistillConfig.__dataclass_fields__}
         s2 = LatentKpDistillPolicy(LatentKpDistillConfig(**s2_algo), observation_spec, action_spec, reward_spec, device, env)
         s2.load_state_dict(state["policy"])
