@@ -78,6 +78,7 @@ class LatentPPOConfig:
     gamma: float = 0.99
     lam: float = 0.95
     desired_kl: float = 0.01
+    lr_min: float = 1e-5  # floor of the adaptive schedule (rsl_rl uses 1e-5)
     max_grad_norm: float = 1.0
     value_loss_coef: float = 1.0
     entropy_coef: float = 0.0
@@ -376,7 +377,7 @@ class LatentPPOPolicy(PPOBase):
                 n += 1
                 if not warmup and cfg.desired_kl > 0:  # rsl_rl "adaptive" schedule
                     if kl > 2.0 * cfg.desired_kl:
-                        self.lr = max(1e-5, self.lr / 1.5)
+                        self.lr = max(cfg.lr_min, self.lr / 1.5)
                     elif kl < 0.5 * cfg.desired_kl:
                         self.lr = min(1e-2, self.lr * 1.5)
                     for g in self.opt.param_groups:
